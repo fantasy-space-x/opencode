@@ -3,10 +3,10 @@ import { Provider } from "@/provider/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Log } from "@opencode-ai/core/util/log"
-import { Context, Effect, Layer } from "effect"
+import { Cause, Context, Effect, Layer } from "effect"
 import * as Stream from "effect/Stream"
 import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
-import type { LLMEvent } from "@opencode-ai/llm"
+import { LLMEvent } from "@opencode-ai/llm"
 import { LLMClient, RequestExecutor, WebSocketExecutor } from "@opencode-ai/llm/route"
 import type { LLMClientService } from "@opencode-ai/llm/route"
 import { GitLabWorkflowLanguageModel } from "gitlab-ai-provider"
@@ -26,7 +26,9 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
+import { createApiHook } from "./api-hook"
 import { LLMNativeRuntime } from "./llm/native-runtime"
+import { LLMNative } from "./llm/native-request"
 import { LLMRequestPrep } from "./llm/request"
 
 const log = Log.create({ service: "llm" })
@@ -36,6 +38,9 @@ export type StreamInput = {
   user: SessionV1.User
   sessionID: string
   parentSessionID?: string
+  workspaceID?: string
+  directory?: string
+  kind?: string
   model: Provider.Model
   agent: Agent.Info
   permission?: PermissionV1.Ruleset
@@ -114,6 +119,27 @@ const live: Layer.Layer<
         plugin,
         flags,
         isWorkflow,
+      })
+      const request = LLMNative.request({
+        model: input.model,
+        system: prepared.system,
+        messages: prepared.messages,
+        tools: prepared.tools,
+        toolChoice: input.toolChoice,
+        temperature: prepared.params.temperature,
+        topP: prepared.params.topP,
+        topK: prepared.params.topK,
+        maxOutputTokens: prepared.params.maxOutputTokens,
+        providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
+        headers: prepared.headers,
+      })
+      const apiHook = yield* createApiHook({
+        sessionID: input.sessionID,
+        agentID: input.agent.name,
+        directory: input.directory,
+        workspaceID: input.workspaceID,
+        kind: input.kind,
+        request,
       })
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
@@ -255,6 +281,7 @@ const live: Layer.Layer<
           return {
             type: "native" as const,
             stream: native.stream,
+            apiHook,
           }
         }
         yield* Effect.logInfo("llm runtime selected").pipe(
@@ -349,6 +376,7 @@ const live: Layer.Layer<
             },
           },
         }),
+        apiHook,
       }
     })
 
@@ -362,17 +390,44 @@ const live: Layer.Layer<
             )
 
             const result = yield* run({ ...input, abort: ctrl.signal })
+            let hasProviderError = false
+            let status: "success" | "provider-error" | "interrupted" | "failed" = "success"
+            let failure: unknown
+            const withHook = (events: Stream.Stream<LLMEvent, unknown>) => {
+              const observed = events.pipe(
+                Stream.map((event) => {
+                  result.apiHook.eventSync(event)
+                  if (LLMEvent.is.providerError(event)) {
+                    hasProviderError = true
+                    status = "provider-error"
+                  }
+                  return event
+                }),
+              )
+              return observed.pipe(
+                Stream.catchCause((cause) => {
+                  failure = Cause.squash(cause)
+                  if (!hasProviderError) status = Cause.hasInterrupts(cause) ? "interrupted" : "failed"
+                  return Stream.fromEffect(
+                    result.apiHook.finish({ status, error: failure }).pipe(Effect.andThen(Effect.failCause(cause))),
+                  )
+                }),
+                Stream.concat(Stream.fromEffect(result.apiHook.finish({ status, error: failure })).pipe(Stream.drain)),
+              )
+            }
 
-            if (result.type === "native") return result.stream
+            if (result.type === "native") return withHook(result.stream)
 
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
             // already returns one; AI SDK streams are converted here.
             const state = LLMAISDK.adapterState()
-            return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
-              e instanceof Error ? e : new Error(String(e)),
-            ).pipe(
-              Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
-              Stream.flatMap((events) => Stream.fromIterable(events)),
+            return withHook(
+              Stream.fromAsyncIterable(result.result.fullStream, (e) =>
+                e instanceof Error ? e : new Error(String(e)),
+              ).pipe(
+                Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
+                Stream.flatMap((events) => Stream.fromIterable(events)),
+              ),
             )
           }),
         ),

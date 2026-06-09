@@ -29,6 +29,7 @@ import { SessionInput } from "../input"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
 import { type RunError, Service, StepLimitExceededError } from "./index"
+import { createApiHook } from "./api-hook"
 import { SessionRunnerModel } from "./model"
 import { createLLMEventPublisher } from "./publish-llm-event"
 import { toLLMMessages } from "./to-llm-message"
@@ -222,6 +223,14 @@ export const layer = Layer.effect(
           .map(SystemPart.make),
         messages: toLLMMessages(context, model),
         tools: toolMaterialization.definitions,
+        metadata: {
+          kind: "session_runner",
+          sessionID: session.id,
+          threadID: session.id,
+          workspaceID: session.location.workspaceID,
+          directory: session.location.directory,
+          agentID: agent.id,
+        },
       })
       if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request }))
         return yield* Effect.die(rebuildPreparedTurn())
@@ -240,9 +249,16 @@ export const layer = Layer.effect(
       let overflowFailure: ProviderErrorEvent | undefined
       if (!(yield* SessionContextEpoch.current(db, session.id, agent.id, system.revision)))
         return yield* Effect.die(rebuildPreparedTurn())
+      const apiHook = yield* createApiHook({
+        sessionID: session.id,
+        location: session.location,
+        request,
+        agentID: agent.id,
+      })
       const providerStream = llm.stream(request).pipe(
         Stream.runForEach((event) =>
           Effect.gen(function* () {
+            yield* apiHook.event(event)
             if (overflowFailure || publisher.hasProviderError()) return
             if (LLMEvent.is.providerError(event)) {
               if (isContextOverflowFailure(event) && !publisher.hasAssistantStarted()) {
@@ -293,6 +309,18 @@ export const layer = Layer.effect(
             (yield* restore(recoverOverflow({ sessionID: session.id, entries, model, request })))
           )
             return yield* Effect.die(continueAfterOverflowCompaction)
+          if (overflowFailure) yield* apiHook.event(overflowFailure)
+          yield* apiHook.finish({
+            status:
+              overflowFailure || publisher.hasProviderError()
+                ? "provider-error"
+                : stream._tag === "Failure" && Cause.hasInterrupts(stream.cause)
+                  ? "interrupted"
+                  : stream._tag === "Failure"
+                    ? "failed"
+                    : "success",
+            error: failure,
+          })
           if (overflowFailure) yield* publish(overflowFailure)
           const llmFailure = failure instanceof LLMError ? failure : undefined
           if (llmFailure && !publisher.hasProviderError()) {

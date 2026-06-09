@@ -966,7 +966,13 @@ export const layer = Layer.effect(
             ctx.currentTextID = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
-            const stream = llm.stream(streamInput)
+            const info = yield* session.get(ctx.sessionID).pipe(Effect.orDie)
+            const stream = llm.stream({
+              ...streamInput,
+              directory: info.directory,
+              workspaceID: info.workspaceID,
+              kind: "session_processor",
+            })
 
             yield* stream.pipe(
               Stream.tap((event) => handleEvent(event)),
