@@ -130,14 +130,14 @@ export const createApiHook = Effect.fn("SessionApiHook.create")(function* (input
     },
     finish: (result: { status: "success" | "provider-error" | "interrupted" | "failed"; error?: unknown }) =>
       append(target, {
-        time: new Date().toISOString(),
+        timestamp: new Date().toISOString(),
         startedAt,
         type: "llm.call",
-        sessionID: input.sessionID,
-        threadID: input.sessionID,
-        agentID: input.agentID,
+        session_id: input.sessionID,
+        thread_id: input.sessionID,
+        agent: input.agentID,
         workspaceID: input.workspaceID,
-        directory,
+        work_dir: directory,
         kind: input.kind,
         request: LLMRequest.input(input.request),
         response: {
