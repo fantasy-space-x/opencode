@@ -61,6 +61,14 @@ function show(out: string) {
   process.stderr.write(out)
 }
 
+function redactArgs(input: string[]) {
+  return input.map((arg, index) => {
+    if (input[index - 1] === "--api-key") return "********"
+    if (arg.startsWith("--api-key=")) return "--api-key=********"
+    return arg
+  })
+}
+
 const cli = yargs(args)
   .parserConfiguration({ "populate--": true })
   .scriptName("opencode")
@@ -105,7 +113,7 @@ const cli = yargs(args)
 
     Log.Default.info("opencode", {
       version: InstallationVersion,
-      args: process.argv.slice(2),
+      args: redactArgs(process.argv.slice(2)),
       process_role: processMetadata.processRole,
       run_id: processMetadata.runID,
     })
